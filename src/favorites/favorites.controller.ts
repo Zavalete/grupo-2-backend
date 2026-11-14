@@ -6,8 +6,8 @@ import { FavoritesService } from './favorites.service';
 import { AddFavoriteDto } from '../dto/add-favorite.dto';
 import { FavoriteProductDto } from '../dto/favorite-product.dto';
 
-@ApiTags('Favoritos')
-@Controller('customers/:customerId/favoritos')
+@ApiTags('Favorites')
+@Controller('customers/:customerId/favorites')
 export class FavoritesController {
 
   constructor(private readonly favoritesService: FavoritesService) { }
