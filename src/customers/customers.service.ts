@@ -162,6 +162,21 @@ export class CustomersService {
     );
   }
 
+
+async validateOwnership(
+  customerId: number,
+  userId: number,
+): Promise<void> {
+  const customer = await this.findCustomer(customerId);
+
+  if (customer.userId !== userId) {
+    throw new ForbiddenException(
+      'No tienes permisos para acceder a este perfil.',
+    );
+  }
+}
+
+
   async validateCustomer(customerId: number): Promise<void> {
     await this.findCustomer(customerId);
   }

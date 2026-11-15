@@ -14,6 +14,7 @@ import { FileEntity } from './models/file.entity';
 import { SustainabilityAttributeEntity } from './models/sustainability-attribute.entity';
 import { OrderEntity } from './models/order.entity';
 import { ReturnEntity } from './models/return.entity';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -42,8 +43,8 @@ import { ReturnEntity } from './models/return.entity';
     ProducersModule,
     CustomersModule,
     ArticlesModule,
-    CartsModule,
-    AddressesModule],
+    AuthModule,
+  ],
   controllers: [],
   providers: [],
 })
