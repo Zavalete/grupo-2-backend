@@ -82,24 +82,123 @@ export class ProductsService {
     const queryBuilder = this.createPublicProductsQuery();
 
     if (query.search && query.search.trim() !== '') {
-      queryBuilder.andWhere('product.name ILIKE :search', {
-        search: `%${query.search.trim()}%`
-      });
+      queryBuilder.andWhere('product.name ILIKE :search', { search: `%${query.search.trim()}%` });
     }
 
     if (query.categoryId !== undefined) {
-      queryBuilder.andWhere('product.categoryId = :categoryId', {
-        categoryId: query.categoryId
-      });
+      queryBuilder.andWhere('product.categoryId = :categoryId', { categoryId: query.categoryId });
     }
 
     if (query.producerId !== undefined) {
-      queryBuilder.andWhere('product.producerId = :producerId', {
-        producerId: query.producerId
-      });
+      queryBuilder.andWhere('product.producerId = :producerId', { producerId: query.producerId });
     }
 
+    if (query.minPrice !== undefined && query.maxPrice !== undefined && query.minPrice > query.maxPrice) {
+      throw new BadRequestException('El precio mínimo no puede ser superior al precio máximo.');
+    }
+
+    const activeOffer = `product.offer_price IS NOT NULL AND product.offer_start_at <= :now AND product.offer_end_at > :now`;
+
+    const effectivePrice = `CASE WHEN ${activeOffer} THEN product.offer_price ELSE product.price END`;
+
+    if (query.minPrice !== undefined) {
+      queryBuilder.andWhere(`(${effectivePrice}) >= :minPrice`, { minPrice: query.minPrice, now });
+    }
+
+    if (query.maxPrice !== undefined) {
+      queryBuilder.andWhere(`(${effectivePrice}) <= :maxPrice`, { maxPrice: query.maxPrice, now });
+    }
+
+    if (query.available !== undefined) {
+      queryBuilder.andWhere(query.available ? 'product.stock > 0' : 'product.stock = 0');
+    }
+
+    if (query.onSale !== undefined) {
+      queryBuilder.andWhere(query.onSale ? `(${activeOffer})` : `NOT (${activeOffer})`, { now });
+    }
+
+    if (query.sustainabilityAttributeIds?.length) {
+      queryBuilder.andWhere(`
+      product.id IN (
+        SELECT psa.product_id
+        FROM product_sustainability_attributes psa
+        WHERE psa.sustainability_attribute_id IN (:...attributeIds)
+        GROUP BY psa.product_id
+        HAVING COUNT(DISTINCT psa.sustainability_attribute_id) = :attributeCount
+      )
+    `, { attributeIds: query.sustainabilityAttributeIds, attributeCount: query.sustainabilityAttributeIds.length });
+    }
+
+    this.applySpecializedFilters(queryBuilder, query);
+
     return this.paginateProducts(queryBuilder, query, now);
+  }
+
+  private applySpecializedFilters(queryBuilder: SelectQueryBuilder<ProductEntity>, query: ProductQueryDto): void {
+
+    if (query.minWeightG !== undefined && query.maxWeightG !== undefined && query.minWeightG > query.maxWeightG) {
+      throw new BadRequestException('El peso mínimo no puede ser superior al peso máximo.');
+    }
+
+    if (query.minVolumeMl !== undefined && query.maxVolumeMl !== undefined && query.minVolumeMl > query.maxVolumeMl) {
+      throw new BadRequestException('El volumen mínimo no puede ser superior al volumen máximo.');
+    }
+
+    if (query.minWeightG !== undefined || query.maxWeightG !== undefined) {
+      const tables = ['food_details', 'garden_details', 'pet_details', 'craft_details'];
+      const conditions = ['detail.product_id = product.id'];
+
+      if (query.minWeightG !== undefined) {
+        conditions.push('detail.weight_g >= :minWeightG');
+      }
+
+      if (query.maxWeightG !== undefined) {
+        conditions.push('detail.weight_g <= :maxWeightG');
+      }
+
+      const filters = tables.map(table => `EXISTS (SELECT 1 FROM ${table} detail WHERE ${conditions.join(' AND ')})`);
+
+      queryBuilder.andWhere(`(${filters.join(' OR ')})`, { minWeightG: query.minWeightG, maxWeightG: query.maxWeightG });
+    }
+
+    if (query.minVolumeMl !== undefined || query.maxVolumeMl !== undefined) {
+      const tables = ['personal_care_details', 'home_cleaning_details', 'wellness_details'];
+      const conditions = ['detail.product_id = product.id'];
+
+      if (query.minVolumeMl !== undefined) {
+        conditions.push('detail.volume_ml >= :minVolumeMl');
+      }
+
+      if (query.maxVolumeMl !== undefined) {
+        conditions.push('detail.volume_ml <= :maxVolumeMl');
+      }
+
+      const filters = tables.map(table => `EXISTS (SELECT 1 FROM ${table} detail WHERE ${conditions.join(' AND ')})`);
+
+      queryBuilder.andWhere(`(${filters.join(' OR ')})`, { minVolumeMl: query.minVolumeMl, maxVolumeMl: query.maxVolumeMl });
+    }
+
+    const textFilters = [
+      { field: 'skinType', column: 'skin_type', value: query.skinType, tables: ['personal_care_details'] },
+      { field: 'material', column: 'material', value: query.material, tables: ['garden_details', 'clothing_details', 'pet_details', 'craft_details'] },
+      { field: 'usageType', column: 'usage_type', value: query.usageType, tables: ['garden_details'] },
+      { field: 'applicationSurface', column: 'application_surface', value: query.applicationSurface, tables: ['home_cleaning_details'] },
+      { field: 'fragrance', column: 'fragrance', value: query.fragrance, tables: ['wellness_details'] },
+      { field: 'format', column: 'format', value: query.format, tables: ['wellness_details'] },
+      { field: 'productSize', column: 'size', value: query.productSize, tables: ['clothing_details', 'pet_details'] },
+      { field: 'color', column: 'color', value: query.color, tables: ['clothing_details', 'craft_details'] },
+      { field: 'petType', column: 'pet_type', value: query.petType, tables: ['pet_details'] },
+    ];
+
+    for (const filter of textFilters) {
+      if (filter.value === undefined || filter.value.trim() === '') {
+        continue;
+      }
+
+      const filters = filter.tables.map(table => `EXISTS (SELECT 1 FROM ${table} detail WHERE detail.product_id = product.id AND detail.${filter.column} ILIKE :${filter.field})`);
+
+      queryBuilder.andWhere(`(${filters.join(' OR ')})`, { [filter.field]: `%${filter.value.trim()}%` });
+    }
   }
 
   async findProductsOnSale(pagination: PaginationDto) {
@@ -123,7 +222,7 @@ export class ProductsService {
     );
   }
 
-  async findBestSellingProducts(quantity: number): Promise<BestSellingProductDto[]> {
+  async findBestSellingProducts(quantity: number, categoryId?: number): Promise<BestSellingProductDto[]> {
     this.validateQuantity(quantity);
 
     const now = new Date();
@@ -157,14 +256,14 @@ export class ProductsService {
           AND o.delivered_at <= $2
           AND p.is_active = true
           AND u.is_active = true
-          AND u.role = 'PRODUCER'
+        AND u.role = 'PRODUCER'
+        AND ($4::integer IS NULL OR p.category_id = $4)
         GROUP BY oi.product_id
         HAVING SUM(oi.quantity - COALESCE(returned.quantity, 0)) > 0
         ORDER BY "unitsSold" DESC, oi.product_id ASC
         LIMIT $3
         `,
-      [since, now, quantity],
-    );
+      [since, now, quantity, categoryId ?? null]);
 
     if (sales.length === 0) {
       return []
