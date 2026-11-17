@@ -20,6 +20,9 @@ import { ProducerProfileDto } from '../dto/producer-profile.dto';
 import { DuplicateEmailError } from '../common/errors/duplicate-email.error';
 import { UpdateUserStatusDto } from '../dto/update-user-status.dto';
 import { UpdateProducerDto } from '../dto/update-producer.dto';
+import { ProductImageDto } from '../dto/product-image.dto';
+import { FilesService } from '../files/files.service';
+import { FileEntity } from '../models/file.entity';
 
 @Injectable()
 export class ProducersService {
@@ -27,10 +30,9 @@ export class ProducersService {
     constructor(
         @InjectRepository(ProducerEntity)
         private readonly producersRepository: Repository<ProducerEntity>,
-
         private readonly productsService: ProductsService,
-
-        private readonly dataSource: DataSource) { }
+        private readonly dataSource: DataSource,
+        private readonly filesService: FilesService) { }
 
     async create(dto: CreateProducerDto): Promise<ProducerProfileDto> {
         const email = dto.email.trim().toLowerCase();
@@ -259,6 +261,90 @@ export class ProducersService {
         return this.findProfile(producerId, userId);
     }
 
+    async uploadImage(producerId: number, archivo: Express.Multer.File, userId: number, domain: 'perfiles' | 'logos' | 'banners'): Promise<ProducerProfileDto> {
+
+        let storageKey: string | undefined;
+
+        try {
+            const previousStorageKey = await this.dataSource.transaction(async manager => {
+
+                await this.validateOwnership(producerId, userId, manager);
+
+                const producer = await manager.findOne(ProducerEntity, {
+                    where: { id: producerId, userId },
+                    lock: { mode: 'pessimistic_write' },
+                });
+
+                const user = await manager.findOne(UserEntity, {
+                    where: { id: userId, isActive: true },
+                    lock: { mode: 'pessimistic_write' },
+                });
+
+                if (!producer || !user) {
+                    throw new ForbiddenException('Usuario no autorizado.');
+                }
+
+                const previousFileId = domain === 'perfiles' ? user.profileFileId : domain === 'logos' ? producer.logoFileId : producer.bannerFileId;
+
+                const file = await this.filesService.saveImage(archivo, domain, manager);
+
+                storageKey = file.storageKey;
+
+                if (domain === 'perfiles') {
+
+                    await manager.update(UserEntity, user.id, {
+                        profileFileId: file.id,
+                        updatedAt: new Date(),
+                    });
+
+                } else if (domain === 'logos') {
+
+                    await manager.update(ProducerEntity, producer.id, {
+                        logoFileId: file.id,
+                        updatedAt: new Date(),
+                    });
+
+                } else {
+
+                    await manager.update(ProducerEntity, producer.id, {
+                        bannerFileId: file.id,
+                        updatedAt: new Date(),
+                    });
+                }
+
+                if (previousFileId) {
+
+                    const previousFile = await manager.findOne(FileEntity, {
+                        where: { id: previousFileId },
+                    });
+
+                    if (previousFile) {
+                        await manager.delete(FileEntity, previousFile.id);
+
+                        return previousFile.storageKey;
+                    }
+                }
+
+                return undefined;
+            });
+
+            if (previousStorageKey) {
+                await this.filesService.deletePhysicalImage(previousStorageKey);
+            }
+
+        } catch (error) {
+            if (storageKey) {
+                await this.filesService.deletePhysicalImage(storageKey);
+            }
+
+            throw error;
+        }
+
+        const producer = await this.findProducer(producerId);
+
+        return ProducerMapper.toProfileDto(producer);
+    }
+
     async findProductsByProducer(producerId: number, pagination: PaginationDto) {
 
         await this.findProducer(producerId);
@@ -422,6 +508,27 @@ export class ProducersService {
         await this.validateOwnership(producerId, userId);
 
         return this.productsService.update(producerId, productId, dto);
+    }
+
+    async addProductImage(producerId: number, productId: number, archivo: Express.Multer.File, userId: number): Promise<ProductImageDto> {
+
+        await this.validateOwnership(producerId, userId);
+
+        return this.productsService.addImage(producerId, productId, archivo);
+    }
+
+    async setPrimaryProductImage(producerId: number, productId: number, imageId: number, userId: number): Promise<ProductImageDto> {
+
+        await this.validateOwnership(producerId, userId);
+
+        return this.productsService.setPrimaryImage(producerId, productId, imageId);
+    }
+
+    async deleteProductImage(producerId: number, productId: number, imageId: number, userId: number): Promise<void> {
+
+        await this.validateOwnership(producerId, userId);
+
+        return this.productsService.deleteImage(producerId, productId, imageId);
     }
 
     async findManagedProducts(producerId: number, pagination: PaginationDto, userId: number) {

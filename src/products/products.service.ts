@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder, In, EntityManager, DataSource } from 'typeorm';
 import { ProductEntity } from '../models/product.entity';
@@ -33,6 +33,9 @@ import { ProductSpecializedDetailsDto } from '../dto/product-specialized-details
 import { CategoryNotFoundError } from '../common/errors/category-not-found.error';
 import { InvalidProductError } from '../common/errors/invalid-product.error';
 import { UpdateProductDto } from '../dto/update-product.dto';
+import { FilesService } from '../files/files.service';
+import { ProductImageDto } from '../dto/product-image.dto';
+import { FileEntity } from 'src/models/file.entity';
 
 @Injectable()
 export class ProductsService {
@@ -75,7 +78,8 @@ export class ProductsService {
     private readonly craftDetailsRepository: Repository<CraftDetailEntity>,
 
     private readonly dataSource: DataSource,
-  ) { }
+
+    private readonly filesService: FilesService) { }
 
   async findAll(query: ProductQueryDto) {
     const now = new Date();
@@ -299,10 +303,11 @@ export class ProductsService {
     return this.toDetailDto(product);
   }
 
-  private async toDetailDto(product: ProductEntity): Promise<ProductDetailDto> {
+  private async toDetailDto(product: ProductEntity, productImages?: ProductImageEntity[]): Promise<ProductDetailDto> {
+
     const [summary] = await this.toSummaryDtos([product], new Date());
 
-    const images = await this.productImagesRepository.find({
+    const images = productImages ?? await this.productImagesRepository.find({
       where: { productId: product.id },
       order: { displayOrder: 'ASC' },
     });
@@ -319,7 +324,13 @@ export class ProductsService {
   }
 
   private async toManagedProductDto(product: ProductEntity): Promise<ManagedProductDto> {
-    const detail = await this.toDetailDto(product);
+
+    const images = await this.productImagesRepository.find({
+      where: { productId: product.id },
+      order: { displayOrder: 'ASC' },
+    });
+
+    const detail = await this.toDetailDto(product, images);
 
     const attributes = await this.sustainabilityRepository.find({
       where: { productId: product.id },
@@ -333,6 +344,13 @@ export class ProductsService {
       offerStartAt: product.offerStartAt,
       offerEndAt: product.offerEndAt,
       sustainabilityAttributeIds: attributes.map(item => item.sustainabilityAttributeId),
+      images: images.map(image => ({
+        id: image.id,
+        productId: image.productId,
+        fileId: image.fileId,
+        displayOrder: image.displayOrder,
+        isPrimary: image.isPrimary,
+      })),
     };
   }
 
@@ -344,6 +362,151 @@ export class ProductsService {
       .where('product.producerId = :producerId', { producerId });
 
     return this.paginateProducts(queryBuilder, pagination, new Date(), true);
+  }
+
+  async addImage(producerId: number, productId: number, archivo: Express.Multer.File): Promise<ProductImageDto> {
+
+    await this.findManagedProduct(producerId, productId);
+
+    let storageKey: string | undefined;
+
+    try {
+      return await this.dataSource.transaction(async manager => {
+
+        const product = await manager.findOne(ProductEntity, {
+          where: { id: productId, producerId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        if (!product) {
+          throw new ProductNotFoundError();
+        }
+
+        const images = await manager.find(ProductImageEntity, {
+          where: { productId },
+          order: { displayOrder: 'DESC' },
+        });
+
+        const displayOrder = images.length > 0 ? images[0].displayOrder + 1 : 1;
+
+        const file = await this.filesService.saveImage(archivo, 'productos', manager);
+
+        storageKey = file.storageKey;
+
+        const image = manager.create(ProductImageEntity, {
+          productId,
+          fileId: file.id,
+          displayOrder,
+          isPrimary: images.length === 0,
+        });
+
+        const savedImage = await manager.save(image);
+
+        return {
+          id: savedImage.id,
+          productId: savedImage.productId,
+          fileId: savedImage.fileId,
+          displayOrder: savedImage.displayOrder,
+          isPrimary: savedImage.isPrimary,
+        };
+      });
+
+    } catch (error) {
+      if (storageKey) {
+        await this.filesService.deletePhysicalImage(storageKey);
+      }
+
+      throw error;
+    }
+  }
+
+  async setPrimaryImage(producerId: number, productId: number, imageId: number): Promise<ProductImageDto> {
+
+    await this.findManagedProduct(producerId, productId);
+
+    return this.dataSource.transaction(async manager => {
+
+      const product = await manager.findOne(ProductEntity, {
+        where: { id: productId, producerId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!product) {
+        throw new ProductNotFoundError();
+      }
+
+      const image = await manager.findOne(ProductImageEntity, {
+        where: { id: imageId, productId },
+      });
+
+      if (!image) {
+        throw new NotFoundException('Imagen no encontrada.');
+      }
+
+      await manager.update(ProductImageEntity, { productId, isPrimary: true }, { isPrimary: false });
+
+      image.isPrimary = true;
+
+      const savedImage = await manager.save(image);
+
+      return {
+        id: savedImage.id,
+        productId: savedImage.productId,
+        fileId: savedImage.fileId,
+        displayOrder: savedImage.displayOrder,
+        isPrimary: savedImage.isPrimary,
+      };
+    });
+  }
+
+  async deleteImage(producerId: number, productId: number, imageId: number): Promise<void> {
+
+    await this.findManagedProduct(producerId, productId);
+
+    const storageKey = await this.dataSource.transaction(async manager => {
+
+      const product = await manager.findOne(ProductEntity, {
+        where: { id: productId, producerId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!product) {
+        throw new ProductNotFoundError();
+      }
+
+      const image = await manager.findOne(ProductImageEntity, {
+        where: { id: imageId, productId },
+        relations: { file: true },
+      });
+
+      if (!image) {
+        throw new NotFoundException('Imagen no encontrada.');
+      }
+
+      const file = image.file;
+      const wasPrimary = image.isPrimary;
+
+      await manager.delete(ProductImageEntity, image.id);
+      await manager.delete(FileEntity, file.id);
+
+      if (wasPrimary) {
+
+        const remainingImages = await manager.find(ProductImageEntity, {
+          where: { productId },
+          order: { displayOrder: 'ASC' },
+          take: 1,
+        });
+
+        if (remainingImages.length > 0) {
+          remainingImages[0].isPrimary = true;
+          await manager.save(remainingImages[0]);
+        }
+      }
+
+      return file.storageKey;
+    });
+
+    await this.filesService.deletePhysicalImage(storageKey);
   }
 
   async update(producerId: number, productId: number, dto: UpdateProductDto): Promise<ManagedProductDto> {
