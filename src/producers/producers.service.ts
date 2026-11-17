@@ -2,7 +2,7 @@ import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/com
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager, DataSource } from 'typeorm';
 import { ProducerEntity } from '../models/producer.entity';
-import { UserRole } from '../models/user.entity';
+import { UserEntity, UserRole } from '../models/user.entity';
 import { PaginationDto } from '../dto/pagination.dto';
 import { ProducerSummaryDto } from '../dto/producer-summary.dto';
 import { ProducerDetailDto } from '../dto/producer-detail.dto';
@@ -14,6 +14,12 @@ import { ProductsService } from '../products/products.service';
 import { CreateProductDto } from '../dto/create-product.dto';
 import { ManagedProductDto } from '../dto/managed-product.dto';
 import { UpdateProductDto } from '../dto/update-product.dto';
+import * as argon2 from 'argon2';
+import { CreateProducerDto } from '../dto/create-producer.dto';
+import { ProducerProfileDto } from '../dto/producer-profile.dto';
+import { DuplicateEmailError } from '../common/errors/duplicate-email.error';
+import { UpdateUserStatusDto } from '../dto/update-user-status.dto';
+import { UpdateProducerDto } from '../dto/update-producer.dto';
 
 @Injectable()
 export class ProducersService {
@@ -25,6 +31,56 @@ export class ProducersService {
         private readonly productsService: ProductsService,
 
         private readonly dataSource: DataSource) { }
+
+    async create(dto: CreateProducerDto): Promise<ProducerProfileDto> {
+        const email = dto.email.trim().toLowerCase();
+        const firstName = dto.firstName.trim();
+        const businessName = dto.businessName.trim();
+
+        if (!firstName || !businessName) {
+            throw new BadRequestException('El nombre y el nombre comercial son obligatorios.');
+        }
+
+        if (dto.privacyAccepted !== true) {
+            throw new BadRequestException('Debe aceptar la política de privacidad.');
+        }
+
+        await this.validateEmail(email);
+
+        const passwordHash = await argon2.hash(dto.password, { type: argon2.argon2id });
+
+        return this.dataSource.transaction(async manager => {
+            const user = manager.create(UserEntity, {
+                email,
+                passwordHash,
+                firstName,
+                lastName: dto.lastName?.trim() || null,
+                phone: dto.phone?.trim() || null,
+                profileFileId: null,
+                role: UserRole.PRODUCER,
+                isActive: true,
+                privacyAcceptedAt: new Date(),
+            });
+
+            const savedUser = await manager.save(user);
+
+            const producer = manager.create(ProducerEntity, {
+                userId: savedUser.id,
+                businessName,
+                description: dto.description?.trim() || null,
+                location: dto.location?.trim() || null,
+                websiteUrl: dto.websiteUrl?.trim() || null,
+                logoFileId: null,
+                bannerFileId: null,
+            });
+
+            const savedProducer = await manager.save(producer);
+
+            savedProducer.user = savedUser;
+
+            return ProducerMapper.toProfileDto(savedProducer);
+        });
+    }
 
     async findAll(pagination: PaginationDto) {
         const { page, size, sortBy, sortDirection } = pagination;
@@ -76,9 +132,131 @@ export class ProducersService {
         };
     }
 
+    async findManagedProducers(pagination: PaginationDto) {
+        const { page, size, sortBy, sortDirection } = pagination;
+        const allowedSortFields = ['id', 'businessName', 'location', 'createdAt', 'firstName', 'lastName', 'email', 'isActive'];
+
+        if (!allowedSortFields.includes(sortBy)) {
+            throw new BadRequestException('Campo de ordenamiento inválido.');
+        }
+
+        const userFields = ['firstName', 'lastName', 'email', 'isActive'];
+        const sortField = userFields.includes(sortBy) ? `user.${sortBy}` : `producer.${sortBy}`;
+
+        const query = this.producersRepository.createQueryBuilder('producer')
+            .innerJoinAndSelect('producer.user', 'user')
+            .where('user.role = :role', { role: UserRole.PRODUCER });
+
+        const totalElements = await query.getCount();
+
+        query.orderBy(sortField, sortDirection);
+
+        if (sortBy !== 'id') {
+            query.addOrderBy('producer.id', 'ASC');
+        }
+
+        const producers = await query.skip(page * size).take(size).getMany();
+
+        return {
+            content: producers.map(producer => ProducerMapper.toProfileDto(producer)),
+            page,
+            size,
+            totalElements,
+            totalPages: Math.ceil(totalElements / size),
+            sortBy,
+            sortDirection,
+        };
+    }
+
     async findOne(producerId: number): Promise<ProducerDetailDto> {
         const producer = await this.findProducer(producerId);
         return ProducerMapper.toDetailDto(producer);
+    }
+
+    async updateProfile(producerId: number, dto: UpdateProducerDto, userId: number): Promise<ProducerProfileDto> {
+
+        if (!Object.values(dto).some(value => value !== undefined)) {
+            throw new BadRequestException('Debe proporcionar al menos un atributo para actualizar.');
+        }
+
+        await this.dataSource.transaction(async manager => {
+            await this.validateOwnership(producerId, userId, manager);
+
+            const producer = await this.findProducer(producerId, manager);
+            const user = producer.user;
+
+            if (dto.email !== undefined) {
+                const email = dto.email.trim().toLowerCase();
+                await this.validateEmail(email, user.id);
+                user.email = email;
+            }
+
+            if (dto.firstName !== undefined) {
+                const firstName = dto.firstName.trim();
+
+                if (!firstName) {
+                    throw new BadRequestException('El nombre es obligatorio.');
+                }
+
+                user.firstName = firstName;
+            }
+
+            if (dto.lastName !== undefined) {
+                user.lastName = dto.lastName?.trim() || null;
+            }
+
+            if (dto.phone !== undefined) {
+                user.phone = dto.phone?.trim() || null;
+            }
+
+            if (dto.password !== undefined) {
+                user.passwordHash = await argon2.hash(dto.password, { type: argon2.argon2id });
+            }
+
+            if (dto.businessName !== undefined) {
+                const businessName = dto.businessName.trim();
+
+                if (!businessName) {
+                    throw new BadRequestException('El nombre comercial es obligatorio.');
+                }
+
+                producer.businessName = businessName;
+            }
+
+            if (dto.description !== undefined) {
+                producer.description = dto.description?.trim() || null;
+            }
+
+            if (dto.location !== undefined) {
+                producer.location = dto.location?.trim() || null;
+            }
+
+            if (dto.websiteUrl !== undefined) {
+                producer.websiteUrl = dto.websiteUrl?.trim() || null;
+            }
+
+            user.updatedAt = new Date();
+            producer.updatedAt = new Date();
+
+            await manager.update(UserEntity, user.id, {
+                email: user.email,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                phone: user.phone,
+                passwordHash: user.passwordHash,
+                updatedAt: user.updatedAt,
+            });
+
+            await manager.update(ProducerEntity, producer.id, {
+                businessName: producer.businessName,
+                description: producer.description,
+                location: producer.location,
+                websiteUrl: producer.websiteUrl,
+                updatedAt: producer.updatedAt,
+            });
+        });
+
+        return this.findProfile(producerId, userId);
     }
 
     async findProductsByProducer(producerId: number, pagination: PaginationDto) {
@@ -86,6 +264,11 @@ export class ProducersService {
         await this.findProducer(producerId);
 
         return this.productsService.findProductsByProducer(producerId, pagination);
+    }
+
+    async findProfile(producerId: number, userId: number): Promise<ProducerProfileDto> {
+        await this.validateOwnership(producerId, userId);
+        return this.findManagedProducer(producerId);
     }
 
     async getStatistics(producerId: number, query: StatisticsQueryDto, userId: number): Promise<ProducerStatisticsDto> {
@@ -248,30 +431,55 @@ export class ProducersService {
         return this.productsService.findManagedProducts(producerId, pagination);
     }
 
-    private async findProducer(producerId: number, manager?: EntityManager): Promise<ProducerEntity> {
+    async findManagedProducer(producerId: number): Promise<ProducerProfileDto> {
+        const producer = await this.findProducer(producerId, undefined, false);
+        return ProducerMapper.toProfileDto(producer);
+    }
 
-        if (!Number.isInteger(producerId) || producerId <= 0) {
-            throw new BadRequestException(
-                'El identificador debe ser un número entero positivo.',
-            );
+    async updateStatus(producerId: number, dto: UpdateUserStatusDto): Promise<ProducerProfileDto> {
+        const producer = await this.findProducer(producerId, undefined, false);
+
+        await this.dataSource.getRepository(UserEntity).update(producer.userId, {
+            isActive: dto.isActive,
+            updatedAt: new Date(),
+        });
+
+        return this.findManagedProducer(producerId);
+    }
+
+    private async validateEmail(email: string, userId?: number): Promise<void> {
+        const existingUser = await this.dataSource.getRepository(UserEntity)
+            .createQueryBuilder('user')
+            .where('LOWER(user.email) = :email', { email })
+            .getOne();
+
+        if (existingUser && existingUser.id !== userId) {
+            throw new DuplicateEmailError();
         }
-        const repository = manager
-            ? manager.getRepository(ProducerEntity)
-            : this.producersRepository;
+    }
+
+    private async findProducer(producerId: number, manager?: EntityManager, requireActive: boolean = true): Promise<ProducerEntity> {
+        if (!Number.isInteger(producerId) || producerId <= 0) {
+            throw new BadRequestException('El identificador debe ser un número entero positivo.');
+        }
+
+        const repository = manager ? manager.getRepository(ProducerEntity) : this.producersRepository;
 
         const producer = await repository.findOne({
             where: {
                 id: producerId,
                 user: {
-                    isActive: true,
                     role: UserRole.PRODUCER,
+                    ...(requireActive ? { isActive: true } : {}),
                 },
             },
+            relations: { user: true },
         });
 
         if (!producer) {
             throw new ProducerNotFoundError();
         }
+
         return producer;
     }
 }
